@@ -1,0 +1,44 @@
+dataset_params:
+  dataset: 'imagenet'
+  img_size: 224
+  batch_size: 2048
+  num_workers: 16
+  data_path: /dev/shm/imagenet/train
+  val_data_path: /dev/shm/imagenet/val
+  global_crops_scale: (0.4, 1.)
+  local_crops_scale: (0.05, 0.4)
+  num_global_crops: 2
+  num_local_crops: 8
+
+dino:
+  seed: 61
+  optim_params:
+    lr: 0.0005
+    min_lr: 1e-6
+    warmup_epochs: 10
+    weight_decay: 0.04
+    weight_decay_end: 0.4
+    grad_clip: 3.0
+  arch: vit_small
+  student_params:
+    patch_size: 16
+    drop_path_rate: 0.1
+  teacher_params:
+    patch_size: 16
+  head_params:
+    out_dim: 65536
+    norm_last_layer: True
+    hidden_dim: 2048
+    bottleneck_dim: 256
+  center_momentum: 0.9
+  student_temp: 0.1
+  teacher_temp: 0.04
+  warmup_teacher_temp: 0.04
+  warmup_teacher_temp_epochs: 0
+  checkpoint_path: /home/muhammetcan/checkpoints/dino_vit_small_16.pkl
+  linear_eval_checkpoint_path: /home/muhammetcan/checkpoints/dino_vit_small_16_lineareval.pkl
+  epochs: 100
+
+wandb:
+  project: 'DINO'
+  name: 'Dino imagenet'
