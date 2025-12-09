@@ -8,6 +8,8 @@ import jax
 import jax.numpy as jnp
 from flax import linen as nn
 
+import numpy as np
+
 
 def drop_path(x, drop_prob, training=False, rng=None):
     if drop_prob == 0. or not training:
@@ -145,7 +147,6 @@ class VisionTransformer(nn.Module):
     img_size: int = 224
     patch_size: int = 16
     in_chans: int = 3
-    num_classes: int = 0
     embed_dim: int = 768
     depth: int = 12
     num_heads: int = 12
@@ -155,6 +156,8 @@ class VisionTransformer(nn.Module):
     drop_rate: float = 0.
     attn_drop_rate: float = 0.
     drop_path_rate: float = 0.
+    mask_im_modeling: bool = False
+    return_all_tokens: bool = False
 
     def setup(self):
         self.num_features = self.embed_dim
@@ -193,9 +196,14 @@ class VisionTransformer(nn.Module):
         patch_pos_embed = patch_pos_embed.reshape(1, -1, dim)
         return jnp.concatenate([class_pos_embed, patch_pos_embed], axis=1)
 
-    def prepare_tokens(self, x, cls_token, pos_embed, deterministic=False):
+    def prepare_tokens(self, x, cls_token, pos_embed, mask_embed, mask=None, deterministic=False):
         N, H, W, C = x.shape
         x = self.patch_embed(x)
+
+        if mask is not None:
+            x[mask, :] = mask_embed
+
+        x = x.reshape(N, -1, self.embed_dim)
 
         cls_tokens = jnp.broadcast_to(cls_token, (N, 1, self.embed_dim))
         x = jnp.concatenate([cls_tokens, x], axis=1)
@@ -206,7 +214,11 @@ class VisionTransformer(nn.Module):
         return x
 
     @nn.compact
-    def __call__(self, x, train=True):
+    def __call__(self, x, masks=None, train=True):
+        if self.mask_im_modeling:
+            mask_embed = self.param('mask_embed', nn.initializers.zeros, (1, self.embed_dim))
+        else:
+            mask_embed = None
         cls_token = self.param('cls_token', nn.initializers.truncated_normal(stddev=0.02), (1, 1, self.embed_dim))
         pos_embed = self.param(
             'pos_embed',
@@ -214,9 +226,9 @@ class VisionTransformer(nn.Module):
             (1, self.num_patches + 1, self.embed_dim)
         )
 
-        x = self.prepare_tokens(x, cls_token, pos_embed, not train)
+        x = self.prepare_tokens(x, cls_token, pos_embed, mask_embed, masks, not train)
 
-        dpr = [x for x in jnp.linspace(0, self.drop_path_rate, self.depth)]
+        dpr = [x for x in np.linspace(0, self.drop_path_rate, self.depth)]
 
         for i in range(self.depth):
             x = Block(
@@ -231,11 +243,9 @@ class VisionTransformer(nn.Module):
 
         x = nn.LayerNorm()(x)
 
-        cls_token_out = x[:, 0]
-        if self.num_classes > 0:
-            cls_token_out = nn.Dense(self.num_classes)(cls_token_out)
-
-        return cls_token_out
+        if self.return_all_tokens:
+            return x
+        return x[:, 0]
 
 
 def vit_tiny(patch_size=16, **kwargs):

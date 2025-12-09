@@ -29,8 +29,8 @@ class WNLinear(nn.Module):
         return jnp.dot(x, w)
 
 
-class DINOHead(nn.Module):
-    out_dim: int = 65536
+class Head(nn.Module):
+    out_dim: int = 8192
     norm_last_layer: bool = True
     hidden_dim: int = 2048
     bottleneck_dim: int = 256
@@ -52,21 +52,41 @@ class DINOHead(nn.Module):
 
 class DINO(nn.Module):
     backbone: nn.Module
-    head: nn.Module
+    dino_head: nn.Module
+    ibot_head: nn.Module
     num_global_crops: int = 2
     num_local_crops: int = 8
+    apply_dino: bool = True
+    apply_ibot: bool = True
 
     @nn.compact
-    def __call__(self, x_list, train=True):
+    def __call__(self, x_list, masks=None, train=True):
         global_crops = jnp.concatenate(x_list[:self.num_global_crops], axis=0)
-        global_out = self.backbone(global_crops, train=train)
+        global_out = self.backbone(global_crops, masks=masks, train=train)
+
+        if global_out.ndim == 3 and self.apply_ibot:  # [N, L, E]
+            global_cls = global_out[:, 0]
+            global_patches = global_out[:, 1:]
+        else:
+            global_cls = global_out  # [N, E]
+            global_patches = None
 
         if len(x_list) > self.num_global_crops:
             local_crops = jnp.concatenate(x_list[self.num_global_crops:], axis=0)
             local_out = self.backbone(local_crops, train=train)
+            local_cls = local_out[:, 0]
 
-            output_feats = jnp.concatenate([global_out, local_out], axis=0)
+            all_cls = jnp.concatenate([global_cls, local_cls], axis=0)
         else:
-            output_feats = global_out
+            all_cls = global_cls
 
-        return self.head(output_feats)
+        out_dict = {}
+
+        if self.apply_dino:
+            out_dict['cls'] = self.dino_head(all_cls)
+
+        if self.apply_ibot and global_patches is not None:
+            flattened_patches = global_patches.reshape(-1, global_patches.shape[-1])
+            out_dict['patch'] = self.ibot_head(flattened_patches)
+
+        return out_dict
