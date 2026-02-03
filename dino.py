@@ -2,56 +2,58 @@ import jax
 import jax.numpy as jnp
 
 import flax.linen as nn
+from utils import sinkhorn_knopp
 
 
-class WNLinear(nn.Module):
-    out_dim: int
-    norm_last_layer: bool = True
+def l2(x, axis=-1, eps=1e-7):
+    return x * jax.lax.rsqrt((x * x).sum(axis=axis, keepdims=True) + eps)
+
+
+class Projection(nn.Module):
+    hidden_dim: int
+    bottleneck_dim: int
+    n_layers: int = 3
 
     @nn.compact
-    def __call__(self, x):
-        in_dim = x.shape[-1]
+    def __call__(self, x, train=True):
+        x = nn.Dense(features=self.hidden_dim)(x)
+        x = jax.nn.gelu(x)
+        for _ in range(self.n_layers - 2):
+            x = nn.Dense(features=self.hidden_dim)(x)
+            x = jax.nn.gelu(x)
 
-        v = self.param(
-            "v",
-            nn.initializers.truncated_normal(stddev=0.02),
-            (in_dim, self.out_dim)
-        )
-
-        if self.norm_last_layer:
-            g = 1.0
-        else:
-            g = self.param("g", nn.initializers.ones, (self.out_dim,))
-
-        v_norm = v / (jnp.linalg.norm(v, axis=0, keepdims=True) + 1e-12)
-        w = v_norm * g
-
-        return jnp.dot(x, w)
+        x = nn.Dense(features=self.bottleneck_dim)(x)
+        return x
 
 
 class Head(nn.Module):
-    out_dim: int = 8192
-    norm_last_layer: bool = True
-    hidden_dim: int = 2048
-    bottleneck_dim: int = 256
+    hidden_dim: int
+
+    use_bias: bool = False
+    use_weight_norm: bool = True
+
+    norm_eps: float = 1e-12
+    weight_norm_eps: float = 1e-12
 
     @nn.compact
-    def __call__(self, x):
-        x = nn.Dense(self.hidden_dim, kernel_init=nn.initializers.truncated_normal(stddev=0.02))(x)
-        x = jax.nn.gelu(x)
-        x = nn.Dense(self.hidden_dim, kernel_init=nn.initializers.truncated_normal(stddev=0.02))(x)
-        x = jax.nn.gelu(x)
-        x = nn.Dense(self.bottleneck_dim, kernel_init=nn.initializers.truncated_normal(stddev=0.02))(x)
+    def __call__(self, x, train=False):
+        x = l2(x, axis=-1, eps=self.norm_eps)
 
-        x = x / (jnp.linalg.norm(x, axis=-1, keepdims=True) + 1e-12)
-
-        wnl = WNLinear(self.out_dim, self.norm_last_layer)(x)
-
-        return wnl
+        mdl = nn.Dense(
+            features=self.hidden_dim,
+            use_bias=self.use_bias,
+            kernel_init=nn.initializers.truncated_normal(0.02),
+            bias_init=nn.initializers.zeros,
+        )
+        if self.use_weight_norm:
+            mdl = nn.WeightNorm(mdl, epsilon=self.weight_norm_eps)
+        return mdl(x)
 
 
 class DINO(nn.Module):
     backbone: nn.Module
+    dino_proj: nn.Module
+    ibot_proj: nn.Module
     dino_head: nn.Module
     ibot_head: nn.Module
     num_global_crops: int = 2
@@ -60,33 +62,59 @@ class DINO(nn.Module):
     apply_ibot: bool = True
 
     @nn.compact
-    def __call__(self, x_list, masks=None, train=True):
-        global_crops = jnp.concatenate(x_list[:self.num_global_crops], axis=0)
-        global_out = self.backbone(global_crops, masks=masks, train=train)
+    def __call__(self, x_list, is_teacher=False, masks=None, train=True, tau=1.0):
+        if is_teacher and self.apply_dino:
+            global_crops = jnp.concatenate(x_list[:self.num_global_crops], axis=0)
+            global_out = self.backbone(global_crops, train=False)
 
-        if global_out.ndim == 3 and self.apply_ibot:  # [N, L, E]
-            global_cls = global_out[:, 0]
-            global_patches = global_out[:, 1:]
+            teacher_cls = global_out['norm_cls_tokens']  # [NG*N, E]
+
+            teacher_cls = self.dino_proj(teacher_cls)
+            teacher_cls = self.dino_head(teacher_cls)
+
+            global_out["target_cls"] = sinkhorn_knopp(
+                teacher_cls / tau,
+                axis_name="batch" if train else None,
+            )
+
+            if self.apply_ibot:
+                teacher_patch = global_out["norm_patch_tokens"]
+
+                #teacher_patch = self.ibot_proj(teacher_patch)
+                teacher_patch = self.ibot_head(teacher_patch)
+
+                global_out["target_patch"] = sinkhorn_knopp(
+                    teacher_patch / tau,
+                    mask=masks,
+                    axis_name="batch" if train else None,
+                )
+
+            return global_out
         else:
-            global_cls = global_out  # [N, E]
-            global_patches = None
+            global_crops = jnp.concatenate(x_list[:self.num_global_crops], axis=0)
+            global_out = self.backbone(global_crops, masks=masks, train=False)
 
-        if len(x_list) > self.num_global_crops:
-            local_crops = jnp.concatenate(x_list[self.num_global_crops:], axis=0)
-            local_out = self.backbone(local_crops, train=train)
-            local_cls = local_out[:, 0]
+            student_cls = global_out['norm_cls_tokens']
+            student_patch = global_out['norm_patch_tokens'] if self.apply_ibot else None
+            if len(x_list) > self.num_global_crops:
+                local_crops = jnp.concatenate(x_list[self.num_global_crops:], axis=0)
+                local_out = self.backbone(local_crops, train=train)
+                local_cls = local_out['norm_cls_tokens']
 
-            all_cls = jnp.concatenate([global_cls, local_cls], axis=0)
-        else:
-            all_cls = global_cls
+                student_cls = jnp.concatenate([student_cls, local_cls], axis=0)
 
-        out_dict = {}
+            student_cls = self.dino_proj(student_cls)
+            student_cls = self.dino_head(student_cls)
 
-        if self.apply_dino:
-            out_dict['cls'] = self.dino_head(all_cls)
+            if self.apply_ibot:
+                assert student_patch is not None
+                student_patch = self.ibot_proj(student_patch)
+                student_patch = self.ibot_head(student_patch)
 
-        if self.apply_ibot and global_patches is not None:
-            flattened_patches = global_patches.reshape(-1, global_patches.shape[-1])
-            out_dict['patch'] = self.ibot_head(flattened_patches)
+            student_cls = student_cls / tau
+            student_patch = student_patch / tau
 
-        return out_dict
+            global_out["predict_cls"] = student_cls
+            global_out["predict_patch"] = student_patch
+
+            return global_out

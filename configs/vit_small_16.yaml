@@ -17,7 +17,10 @@ dataset_params:
 dino:
   seed: 61
   optim_params:
+    linear_lr: 0.001
     lr: 0.0005
+    beta1: 0.9
+    beta2: 0.999
     min_lr: 1e-6
     warmup_epochs: 10
     weight_decay: 0.04
@@ -29,7 +32,6 @@ dino:
     patch_size: 16
     drop_path_rate: 0.1
     mask_im_modeling: True
-    return_all_tokens: True
   teacher_params:
     patch_size: 16
   head_params:
@@ -37,7 +39,7 @@ dino:
     norm_last_layer: True
     hidden_dim: 2048
     bottleneck_dim: 256
-  center_momentum: 0.9
+  num_classes: 1000
   student_temp: 0.1
   teacher_temp: 0.04
   teacher_temp2: 0.07
@@ -48,6 +50,7 @@ dino:
   checkpoint_path: /home/muhammetcan/checkpoints/dino_vit_small_16.pkl
   linear_eval_checkpoint_path: /home/muhammetcan/checkpoints/dino_vit_small_16_lineareval.pkl
   epochs: 100
+  linear_epochs: 500
 
 wandb:
   project: 'DINO'

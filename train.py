@@ -1,34 +1,22 @@
 import sys
 import yaml
-import os
 
 import jax
 import jax.numpy as jnp
 import optax
-from flax import serialization
 from torchvision.datasets import ImageFolder
 from torch.utils.data import DataLoader
 import wandb
 from augmentation import DataAugmentationDINO, Collate
+from utils import load_checkpoint, save_checkpoint
 import vit
-from dino import DINO, Head
+from dino import DINO, Head, Projection
+from utils import batch_koleo
 
 import numpy as np
 
 
-def save_checkpoint(path, state):
-    with open(path, "wb") as f:
-        f.write(serialization.to_bytes(state))
-
-
-def load_checkpoint(path, state_template):
-    if not os.path.exists(path):
-        return None
-    with open(path, "rb") as f:
-        return serialization.from_bytes(state_template, f.read())
-
-
-def maske_teacher_temp_fn(warmup_teacher_temp, teacher_temp, warmup_teacher_temp_epochs, epochs):
+def make_teacher_temp_fn(warmup_teacher_temp, teacher_temp, warmup_teacher_temp_epochs, epochs):
     def teacher_temp_fn(step):
         idx = jnp.minimum(step, len(teacher_temp_schedule) - 1)
         return teacher_temp_schedule[idx]
@@ -38,14 +26,6 @@ def maske_teacher_temp_fn(warmup_teacher_temp, teacher_temp, warmup_teacher_temp
         jnp.ones(epochs - warmup_teacher_temp_epochs) * teacher_temp
     ))
     return teacher_temp_fn
-
-
-def ema_update(ema_params, new_params, decay):
-    return jax.tree_util.tree_map(
-        lambda e, p: decay * e + (1.0 - decay) * p,
-        ema_params,
-        new_params
-    )
 
 
 def create_weight_decay_mask(params):
@@ -77,115 +57,132 @@ def make_update_fn(
         optimizer,
         student_temp,
         teacher_temp_fn,
-        teacher_temp2_fn,
-        center_momentum,
         momentum_schedule_fn,
         num_crops,
-        num_global_crops):
-    def update_fn(student_params, teacher_params, opt_state, inputs_list, masks, center, center2, rng, step):
+        num_global_crops,
+        koleo_loss_weight):
+    def update_fn(student_params, teacher_params, opt_state, inputs, masks, rng, step):
+        teacher_out_dict = teacher_apply_fn(
+            teacher_params,
+            inputs,
+            is_teacher=True,
+            masks=masks,
+            train=True,
+            tau=teacher_temp_fn(step),
+        )
+
         def loss_fn(params):
             student_out_dict = student_apply_fn(
                 params,
-                inputs_list,
+                inputs,
+                is_teacher=False,
                 masks=masks,
                 train=True,
+                tau=student_temp,
                 rngs={"dropout": rng}
             )
 
-            teacher_out_dict = teacher_apply_fn(
-                teacher_params,
-                inputs_list[:num_global_crops],
-                train=True
+            student_cls = student_out_dict['predict_cls']  # [NC*N, E]
+            teacher_cls = teacher_out_dict['target_cls']  # [NG*N, E]
+
+            student_patch = student_out_dict.get('predict_patch')  # [NG*N, L, E]
+            teacher_patch = teacher_out_dict.get('target_patch')  # [NG*N, L, E]
+
+            g_loss_weight = (num_global_crops - 1) * num_global_crops
+            l_loss_weight = max((num_crops - num_global_crops) * num_global_crops , 1)
+            dino_total_weight = g_loss_weight + l_loss_weight
+
+            g_loss_weight = g_loss_weight / dino_total_weight
+            l_loss_weight = l_loss_weight / dino_total_weight
+
+            student_cls = jnp.reshape(student_cls, (num_crops, -1, student_cls.shape[-1]))  # [NC, N, E]
+            teacher_cls = jnp.reshape(teacher_cls, (num_global_crops, -1, teacher_cls.shape[-1]))  # [NG, N, E]
+
+            g_student_cls = student_cls[:num_global_crops]  # [NG, N, E]
+            l_student_cls = student_cls[num_global_crops:]  # [NL, N, E]
+
+            l_cls_log_probs = jax.nn.log_softmax(l_student_cls, axis=-1)  # [NL, N, E]
+            l_cls_log_probs = jnp.expand_dims(l_cls_log_probs, axis=1)  # [NL, 1, N, E]
+
+            loss = teacher_cls * l_cls_log_probs  # [NL, NG, N, E]
+            loss = jnp.sum(loss, axis=-1)  # [NL, NG, N]
+            loss = -jnp.mean(loss)  # [1]
+
+            l_cls_loss = l_loss_weight * loss
+
+            g_cls_log_probs = jax.nn.log_softmax(g_student_cls, axis=-1)  # [NG, N, E]
+            g_cls_log_probs = jnp.expand_dims(g_cls_log_probs, axis=1)  # [NG, 1, N, E]
+
+            loss = teacher_cls * g_cls_log_probs  # [NG, NG, N, E]
+            loss = jnp.sum(loss, axis=-1)  # [NG, NG, N]
+            loss = jnp.mean(loss, axis=-1)  # [NG, NG]
+
+            mask = 1 - jnp.eye(num_global_crops)  # [NG, NG]
+            loss = -jnp.sum(mask * loss)  # [1]
+
+            g_cls_loss = g_loss_weight * loss
+
+            student_patch = jnp.reshape(student_patch,
+                                        (num_global_crops, -1, *student_patch.shape[-2:]))  # [NG, N, L, E]
+            teacher_patch = jnp.reshape(teacher_patch,
+                                        (num_global_crops, -1, *teacher_patch.shape[-2:]))  # [NG, N, L, E]
+
+            patch_log_probs = jax.nn.log_softmax(student_patch, axis=-1)  # [NG, N, L, E]
+
+            loss = teacher_patch * patch_log_probs  # [NG, N, L, E]
+            loss = jnp.sum(loss, axis=-1)  # [NG, N, L]
+
+            masks = jnp.reshape(masks, (masks.shape[0], num_global_crops, -1))  # [N, NG, L]
+            masks = jnp.swapaxes(masks, 0, 1)  # [NG, N, L]
+
+            loss = jnp.sum(masks * loss, axis=-1)  # [NG, N]
+
+            mask_counts = jnp.sum(masks, axis=-1)  # [NG, N]
+            count_mask = mask_counts != 0  # [NG, N]
+            loss /= jnp.where(count_mask, mask_counts, jnp.ones(()))  # [NG, N]
+            loss = -jnp.sum(loss)  # [1]
+            loss /= jnp.sum(count_mask)  # [1]
+
+            ibot_loss = loss
+
+            g_raw_cls_tokens = student_out_dict["norm_cls_tokens"]  # [NG*N, E]
+            g_raw_cls_tokens = jnp.reshape(g_raw_cls_tokens,
+                                           (num_global_crops, -1, g_raw_cls_tokens.shape[-1]))  # [NG, N, E]
+
+            loss = batch_koleo(g_raw_cls_tokens)  # [NG, N]
+            loss = -jnp.mean(loss)  # [1]
+
+            koleo_loss = koleo_loss_weight *  loss
+
+            losses = dict(
+                g_cls_loss=g_cls_loss,
+                l_cls_loss=l_cls_loss,
+                ibot_loss=ibot_loss,
+                koleo_loss=koleo_loss,
             )
 
-            student_cls = student_out_dict['cls']  # [Num_Crops*N, E]
-            teacher_cls = teacher_out_dict['cls']  # [Num_Global_Crops*N, E]
+            total_loss = g_cls_loss + l_cls_loss + ibot_loss + koleo_loss
 
-            student_patch = student_out_dict.get('patch')  # [Num_Global_Crops*N, L, E]
-            teacher_patch = teacher_out_dict.get('patch')  # [Num_Global_Crops*N, L, E]
+            return total_loss, losses
 
-            student_cls = student_cls / student_temp  # [Num_Crops*N, E]
-            student_cls_logits = student_cls.chunk(num_crops)  # [N, E] for each
-
-            teacher_temp = teacher_temp_fn(step)
-            teacher_cls_centered = teacher_cls - center  # [Num_Global_Crops*N, E]
-            teacher_cls_probs = jax.nn.softmax(teacher_cls_centered / teacher_temp, axis=-1)  # [Num_Global_Crops*N, E]
-            teacher_cls_probs_chunked = teacher_cls_probs.chunk(num_global_crops)  # [N, E] for each
-
-            N = inputs_list[0].shape[0]
-
-            student_cls_logits_stacked = jnp.stack(student_cls_logits)  # [Num_Local_Crops, N, E]
-            teacher_cls_probs_stacked = jnp.stack(teacher_cls_probs_chunked)  # [Num_Global_Crops, N, E]
-
-            student_log_probs = jax.nn.log_softmax(student_cls_logits_stacked, axis=-1)  # [Num_Local_Crops, N, E]
-
-            # [Num_Global_Crops, Num_Crops]
-            dot_products = jnp.einsum('tne, sne -> ts', teacher_cls_probs_stacked, student_log_probs)
-
-            dino_loss_matrix = -dot_products / N  # [Num_Global_Crops, Num_Crops]
-
-            identity = jnp.eye(num_global_crops, num_crops)  # [2, Num_Crops]
-            mask = 1.0 - identity  # [2, Num_Crops]
-            dino_loss = jnp.sum(dino_loss_matrix * mask) / jnp.sum(mask)
-
-            ibot_loss = 0.0
-
-            teacher_patch_mean_batch = jnp.zeros_like(center2)  # [1, 1, E]
-
-            if student_patch is not None and teacher_patch is not None:
-                student_patch = student_patch / student_temp  # [Num_Global_Crops*N, L, E]
-                student_patch = student_patch.reshape(num_global_crops, N, -1, student_patch.shape[-1])  # [2, N, L, E]
-                student_log_patch = jax.nn.log_softmax(student_patch, axis=-1)  # [2, N, L, E]
-
-                teacher_temp2 = teacher_temp2_fn(step)
-                teacher_patch_centered = teacher_patch - center2  # [Num_Global_Crops*N, L, E]
-                teacher_patch_probs = jax.nn.softmax(teacher_patch_centered / teacher_temp2, axis=-1)  # [Num_Global_Crops*N, L, E]
-                teacher_patch_probs = teacher_patch_probs.reshape(num_global_crops, N, -1, teacher_patch.shape[-1])  # [2, N, L, E]
-
-                teacher_patch_flat = teacher_patch_probs.reshape(-1, teacher_patch_probs.shape[-1])  # [Num_Global_Crops*N*L, E]
-                teacher_patch_mean_batch = jnp.mean(teacher_patch_flat, axis=0, keepdims=True)  # [1, E]
-
-                ce_loss = -jnp.sum(teacher_patch_probs * student_log_patch, axis=-1)  # [2, N, L]
-
-                masks_flat = jnp.transpose(masks, (1, 0, 2, 3))  # [N, 2, H, W]
-                masks_flat = masks_flat.reshape(num_global_crops, N, -1)  # [2, N, L]
-
-                masked_ce_loss = masks_flat * ce_loss  # [2, N, L]
-
-                n_masked = jnp.sum(masks_flat) + 1e-6
-                ibot_loss = jnp.sum(masked_ce_loss) / n_masked
-
-            total_loss = dino_loss + ibot_loss
-
-            aux_stats = {
-                "dino_loss": dino_loss,
-                "ibot_loss": ibot_loss,
-                "teacher_cls_mean": jnp.mean(teacher_cls_probs, axis=0, keepdims=True),
-                "teacher_patch_mean": teacher_patch_mean_batch
-            }
-
-            return total_loss, aux_stats
-
-        (loss, aux_stats, grad) = jax.value_and_grad(loss_fn, has_aux=True)(student_params)
+        ((loss, losses), grad) = jax.value_and_grad(loss_fn, has_aux=True)(student_params)
 
         loss = jax.lax.pmean(loss, axis_name='batch')
         grad = jax.lax.pmean(grad, axis_name='batch')
 
-        teacher_cls_mean = jax.lax.pmean(aux_stats['teacher_cls_mean'], axis_name='batch')
-        teacher_patch_mean = jax.lax.pmean(aux_stats['teacher_patch_mean'], axis_name='batch')
-
         updates, opt_state = optimizer.update(grad, opt_state, student_params)
         new_student_params = optax.apply_updates(student_params, updates)
 
-        ema_decay = momentum_schedule_fn(step)
-        new_teacher_params = ema_update(teacher_params, student_params, decay=ema_decay)
+        decay = momentum_schedule_fn(step)
+        new_teacher_params = jax.tree_util.tree_map(
+            lambda e, p: decay * e + (1.0 - decay) * p,
+            teacher_params,
+            new_student_params
+        )
 
-        new_center = center * center_momentum + (1 - center_momentum) * teacher_cls_mean
-        new_center2 = center2 * center_momentum + (1 - center_momentum) * teacher_patch_mean
+        return new_student_params, new_teacher_params, opt_state, loss, losses
 
-        return new_student_params, new_teacher_params, opt_state, new_center, new_center2, loss, aux_stats
-
-    return jax.pmap(update_fn, axis_name='batch', donate_argnums=(0, 1, 2, 5, 6))
+    return jax.pmap(update_fn, axis_name='batch', donate_argnums=(0, 1, 2))
 
 
 def main(config_path):
@@ -238,6 +235,8 @@ def main(config_path):
 
     student = DINO(
         backbone=vit.__dict__[dino_config['arch']](**dino_config['student_params']),
+        dino_proj=Projection(**dino_config['proj_params']),
+        ibot_proj=Projection(**dino_config['proj_params']),
         dino_head=Head(**dino_config['head_params']),
         ibot_head=Head(**dino_config['head_params']),
         num_global_crops=dataset_config['num_global_crops'],
@@ -246,6 +245,8 @@ def main(config_path):
 
     teacher = DINO(
         backbone=vit.__dict__[dino_config['arch']](**dino_config['teacher_params']),
+        dino_proj=Projection(**dino_config['proj_params']),
+        ibot_proj=Projection(**dino_config['proj_params']),
         dino_head=Head(**dino_config['head_params']),
         ibot_head=Head(**dino_config['head_params']),
         num_global_crops=dataset_config['num_global_crops'],
@@ -316,20 +317,11 @@ def main(config_path):
     unreplicate = lambda tree: jax.tree_util.tree_map(lambda x: x[0], tree)
 
     teacher_params = student_params
-    center = jnp.zeros((1, dino_config['head_params']['out_dim']))
-    center2 = jnp.zeros((1, 1, dino_config['head_params']['out_dim']))
 
-    teacher_temp_fn = maske_teacher_temp_fn(
+    teacher_temp_fn = make_teacher_temp_fn(
         warmup_teacher_temp=dino_config['warmup_teacher_temp'],
         teacher_temp=dino_config['teacher_temp'],
         warmup_teacher_temp_epochs=dino_config['warmup_teacher_temp_epochs'],
-        epochs=epochs,
-    )
-
-    teacher_temp2_fn = maske_teacher_temp_fn(
-        warmup_teacher_temp=dino_config['warmup_teacher_temp2'],
-        teacher_temp=dino_config['teacher_temp2'],
-        warmup_teacher_temp_epochs=dino_config['warmup_teacher_patch_temp'],
         epochs=epochs,
     )
 
@@ -339,8 +331,6 @@ def main(config_path):
         optimizer=optimizer,
         student_temp=dino_config['student_temp'],
         teacher_temp_fn=teacher_temp_fn,
-        teacher_temp2_fn=teacher_temp2_fn,
-        center_momentum=dino_config['center_momentum'],
         momentum_schedule_fn=momentum_schedule,
         num_crops=dataset_config['num_global_crops'] + dataset_config['num_local_crops'],
         num_global_crops=dataset_config['num_global_crops'],
@@ -349,23 +339,18 @@ def main(config_path):
     student_params_repl = replicate(student_params)
     teacher_params_repl = replicate(teacher_params)
     opt_state_repl = replicate(opt_state)
-    center_repl = replicate(center)
-    center2_repl = replicate(center2)
 
     state_template = {
         "student_params": unreplicate(student_params_repl),
         "teacher_params": unreplicate(teacher_params_repl),
         "opt_state": unreplicate(opt_state_repl),
-        "center": unreplicate(center_repl),
-        "center2": unreplicate(center2_repl),
         "epoch": 0,
+        "key": key,
     }
 
     del student_params
     del teacher_params
     del opt_state
-    del center
-    del center2
 
     loaded_state = load_checkpoint(checkpoint_path, state_template)
     start_epoch = 0
@@ -375,9 +360,8 @@ def main(config_path):
         student_params_repl = replicate(loaded_state['student_params'])
         teacher_params_repl = replicate(loaded_state['teacher_params'])
         opt_state_repl = replicate(loaded_state['opt_state'])
-        center_repl = loaded_state['center']
-        center2_repl = loaded_state['center2']
         start_epoch = loaded_state['epoch'] + 1
+        key = loaded_state['key']
         global_step = steps_per_epoch * start_epoch
 
     def shard(x):
@@ -402,18 +386,14 @@ def main(config_path):
                 student_params_repl,
                 teacher_params_repl,
                 opt_state_repl,
-                center_repl,
-                center2_repl,
                 loss,
-                aux_stats
+                losses
             ) = update_fn(
                 student_params_repl,
                 teacher_params_repl,
                 opt_state_repl,
                 images,
                 masks,
-                center_repl,
-                center2_repl,
                 rng_shard,
                 step_repl
             )
@@ -421,16 +401,13 @@ def main(config_path):
             step_repl = step_repl + 1
 
             loss = unreplicate(loss)
-            dino_loss = unreplicate(aux_stats['dino_loss'])
-            ibot_loss = unreplicate(aux_stats['ibot_loss'])
-
-            print("Epoch: {} Step: {} Loss: {:.4f} Dino Loss: {:.4f} iBOT Loss{:.4f}".format(
-                epoch, step, float(loss), float(dino_loss), float(ibot_loss)))
 
             run.log({
-                "loss": loss,
-                "dino_loss": dino_loss,
-                "ibot_loss": ibot_loss,
+                "total_loss": loss,
+                "g_cls_loss": losses['g_cls_loss'],
+                "l_cls_loss": losses['l_cls_loss'],
+                "ibot_loss": losses['ibot_loss'],
+                "koleo_loss": losses['koleo_loss'],
                 "epoch": epoch,
             })
 
@@ -438,9 +415,8 @@ def main(config_path):
             "student_params": unreplicate(student_params_repl),
             "teacher_params": unreplicate(teacher_params_repl),
             "opt_state": unreplicate(opt_state_repl),
-            "center": unreplicate(center_repl),
-            "center2": unreplicate(center2_repl),
             "epoch": epoch + 1,
+            "key": key,
         })
 
 

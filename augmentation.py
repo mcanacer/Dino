@@ -138,7 +138,7 @@ class Collate(object):
                         break
             else:
                 break
-        return mask
+        return torch.reshape(mask, (-1,))
 
     def __call__(self, batch):
         images_list, labels_list = zip(*batch)
@@ -148,7 +148,7 @@ class Collate(object):
         collated_masks = []
 
         for i in range(self.num_global_crops):
-            N, _, H_img, W_img = images[i].shape
+            N, H_img, W_img, _ = images[i].shape
             H, W = H_img // self.patch_size, W_img // self.patch_size
 
             batch_masks = []
@@ -158,6 +158,6 @@ class Collate(object):
 
             collated_masks.append(torch.stack(batch_masks))
 
-        masks = torch.stack(collated_masks, dim=1)  # [N, 2, H, W]
+        masks = torch.stack(collated_masks, dim=1)  # [N, 2, HxW]
 
         return images, masks

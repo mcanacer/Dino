@@ -2,6 +2,7 @@
 # https://github.com/facebookresearch/dino/blob/main/vision_transformer.py
 
 import math
+import typing
 from typing import Callable, Optional
 
 import jax
@@ -22,6 +23,17 @@ def drop_path(x, drop_prob, training=False, rng=None):
     return output
 
 
+class LayerScale(nn.Module):
+    init_values: float = 1e-5
+
+    @nn.compact
+    def __call__(self, inputs):
+        embed_dim = jnp.shape(inputs)[-1]
+
+        scale = self.param('scale', nn.initializers.constant(self.init_values), (embed_dim,))
+        return inputs * scale
+
+
 class DropPath(nn.Module):
     drop_prob: float = 0.0
 
@@ -31,6 +43,27 @@ class DropPath(nn.Module):
             return x
         rng = self.make_rng('dropout')
         return drop_path(x, self.drop_prob, training=not deterministic, rng=rng)
+
+
+class SwiGLU(nn.Module):
+    hidden_features: Optional[int] = None
+    out_features: Optional[int] = None
+    act_layer: Callable = nn.silu
+    drop: float = 0.
+
+    @nn.compact
+    def __call__(self, x, deterministic=False):
+        in_features = x.shape[-1]
+        out_features = self.out_features or in_features
+        hidden_features = self.hidden_features or in_features
+
+        hidden_features = (int(hidden_features * 2 / 3) + 7) // 8 * 8
+
+        x = nn.Dense(2 * hidden_features, kernel_init=nn.initializers.truncated_normal(stddev=0.02))(x)
+        x1, x2 = jnp.split(x, 2, axis=-1)
+        x = self.act_layer(x1) * x2
+        x = nn.Dense(out_features, kernel_init=nn.initializers.truncated_normal(stddev=0.02))(x)
+        return x
 
 
 class Mlp(nn.Module):
@@ -53,67 +86,44 @@ class Mlp(nn.Module):
         return x
 
 
-class Attention(nn.Module):
-    num_heads: int = 8
-    qkv_bias: bool = False
-    qk_scale: Optional[float] = None
-    attn_drop: float = 0.
-    proj_drop: float = 0.
-
-    @nn.compact
-    def __call__(self, x, deterministic=False):
-        N, L, C = x.shape
-        head_dim = C // self.num_heads
-        scale = self.qk_scale or head_dim ** -0.5
-
-        qkv = nn.Dense(C * 3, use_bias=self.qkv_bias, kernel_init=nn.initializers.truncated_normal(stddev=0.02))(x)
-        qkv = qkv.reshape(N, L, 3, self.num_heads, C // self.num_heads)
-        qkv = jnp.transpose(qkv, (2, 0, 3, 1, 4))
-        q, k, v = qkv[0], qkv[1], qkv[2]
-
-        attn = (q @ jnp.swapaxes(k, -2, -1)) * scale
-        attn = nn.softmax(attn, axis=-1)
-        attn = nn.Dropout(rate=self.attn_drop)(attn, deterministic=deterministic)
-
-        x = (attn @ v).transpose((0, 2, 1, 3)).reshape(N, L, C)
-        x = nn.Dense(C, kernel_init=nn.initializers.truncated_normal(stddev=0.02))(x)
-        x = nn.Dropout(rate=self.proj_drop)(x, deterministic=deterministic)
-        return x, attn
-
-
 class Block(nn.Module):
     num_heads: int
     mlp_ratio: float = 4.
     qkv_bias: bool = False
     qk_scale: Optional[float] = None
+    ffn: typing.Type = SwiGLU
+    init_values: float = 1e-5
     drop: float = 0.
     attn_drop: float = 0.
     drop_path: float = 0.
-    act_layer: Callable = nn.gelu
+    act_layer: Callable = nn.silu
+    eps: float = 1e-06
 
     @nn.compact
     def __call__(self, x, deterministic=False, return_attention=False):
-        y, attn = Attention(
+        y = nn.MultiHeadAttention(
             num_heads=self.num_heads,
-            qkv_bias=self.qkv_bias,
-            qk_scale=self.qk_scale,
-            attn_drop=self.attn_drop,
-            proj_drop=self.drop
-        )(nn.LayerNorm()(x), deterministic=deterministic)
+            use_bias=self.qkv_bias,
+            dropout_rate=self.attn_drop,
+            kernel_init=nn.initializers.truncated_normal(stddev=0.02),
+            bias_init=nn.initializers.zeros,
+        )(nn.LayerNorm(epsilon=self.eps)(x), deterministic=deterministic)
 
-        if return_attention:
-            return attn
+        if self.init_values is not None:
+            y = LayerScale(self.init_values)(y)
 
         if self.drop_path > 0.:
             y = DropPath(drop_prob=self.drop_path)(y, deterministic=deterministic)
         x = x + y
 
         mlp_hidden_dim = int(x.shape[-1] * self.mlp_ratio)
-        mlp_out = Mlp(
+        mlp_out = self.ffn(
             hidden_features=mlp_hidden_dim,
             act_layer=self.act_layer,
             drop=self.drop
-        )(nn.LayerNorm()(x), deterministic=deterministic)
+        )(nn.LayerNorm(epsilon=self.eps)(x), deterministic=deterministic)
+        if self.init_values is not None:
+            mlp_out = LayerScale(self.init_values)(mlp_out)
 
         if self.drop_path > 0.:
             mlp_out = DropPath(drop_prob=self.drop_path)(mlp_out, deterministic=deterministic)
@@ -151,13 +161,15 @@ class VisionTransformer(nn.Module):
     depth: int = 12
     num_heads: int = 12
     mlp_ratio: float = 4.
-    qkv_bias: bool = False
+    qkv_bias: bool = True
     qk_scale: Optional[float] = None
+    ffn: typing.Type = SwiGLU
     drop_rate: float = 0.
     attn_drop_rate: float = 0.
     drop_path_rate: float = 0.
     mask_im_modeling: bool = False
-    return_all_tokens: bool = False
+    num_registers: int = 4
+    eps: float = 1e-06
 
     def setup(self):
         self.num_features = self.embed_dim
@@ -196,12 +208,13 @@ class VisionTransformer(nn.Module):
         patch_pos_embed = patch_pos_embed.reshape(1, -1, dim)
         return jnp.concatenate([class_pos_embed, patch_pos_embed], axis=1)
 
-    def prepare_tokens(self, x, cls_token, pos_embed, mask_embed, mask=None, deterministic=False):
+    def prepare_tokens(self, x, cls_token, pos_embed, mask_embed, mask=None, register_embed=None):
         N, H, W, C = x.shape
         x = self.patch_embed(x)
 
         if mask is not None:
-            x[mask, :] = mask_embed
+            mask = mask.reshape(N, -1, 1)
+            x = mask_embed * mask + x * (1 - mask)
 
         x = x.reshape(N, -1, self.embed_dim)
 
@@ -210,7 +223,10 @@ class VisionTransformer(nn.Module):
 
         x = x + self.interpolate_pos_encoding(x, W, H, pos_embed)
 
-        x = nn.Dropout(rate=self.drop_rate)(x, deterministic=deterministic)
+        if self.num_registers > 0:
+            register_embed = jnp.repeat(register_embed, N, axis=0)
+            x = jnp.concatenate([x[:, :1], register_embed, x[:, 1:]], axis=1)
+
         return x
 
     @nn.compact
@@ -219,14 +235,20 @@ class VisionTransformer(nn.Module):
             mask_embed = self.param('mask_embed', nn.initializers.zeros, (1, self.embed_dim))
         else:
             mask_embed = None
-        cls_token = self.param('cls_token', nn.initializers.truncated_normal(stddev=0.02), (1, 1, self.embed_dim))
+        if self.num_registers > 0:
+            register_embed = self.param('register_embed',
+                                        nn.initializers.truncated_normal(stddev=1e-6),
+                                        (1, self.num_registers, self.embed_dim))
+        else:
+            register_embed = None
+        cls_token = self.param('cls_token', nn.initializers.truncated_normal(stddev=1e-6), (1, 1, self.embed_dim))
         pos_embed = self.param(
             'pos_embed',
             nn.initializers.truncated_normal(stddev=0.02),
             (1, self.num_patches + 1, self.embed_dim)
         )
 
-        x = self.prepare_tokens(x, cls_token, pos_embed, mask_embed, masks, not train)
+        x = self.prepare_tokens(x, cls_token, pos_embed, mask_embed, masks, register_embed)
 
         dpr = [x for x in np.linspace(0, self.drop_path_rate, self.depth)]
 
@@ -236,16 +258,23 @@ class VisionTransformer(nn.Module):
                 mlp_ratio=self.mlp_ratio,
                 qkv_bias=self.qkv_bias,
                 qk_scale=self.qk_scale,
+                ffn=self.ffn,
                 drop=self.drop_rate,
                 attn_drop=self.attn_drop_rate,
-                drop_path=dpr[i]
+                drop_path=dpr[i],
+                eps=self.eps,
             )(x, deterministic=not train)
 
-        x = nn.LayerNorm()(x)
+        x_norm = nn.LayerNorm(epsilon=self.eps)(x)
 
-        if self.return_all_tokens:
-            return x
-        return x[:, 0]
+        return {
+            "cls_tokens": x[:, 0],
+            "registers": x[:, 1:self.num_registers + 1],
+            "patch_tokens": x[:, self.num_registers + 1:],
+            "norm_cls_tokens": x_norm[:, 0],
+            "norm_registers": x_norm[:, 1:self.num_registers + 1],
+            "norm_patch_tokens": x_norm[:, self.num_registers + 1:],
+        }
 
 
 def vit_tiny(patch_size=16, **kwargs):
