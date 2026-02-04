@@ -80,7 +80,7 @@ class DINO(nn.Module):
             if self.apply_ibot:
                 teacher_patch = global_out["norm_patch_tokens"]
 
-                #teacher_patch = self.ibot_proj(teacher_patch)
+                teacher_patch = self.ibot_proj(teacher_patch)
                 teacher_patch = self.ibot_head(teacher_patch)
 
                 global_out["target_patch"] = sinkhorn_knopp(

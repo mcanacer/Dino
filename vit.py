@@ -213,7 +213,8 @@ class VisionTransformer(nn.Module):
         x = self.patch_embed(x)
 
         if mask is not None:
-            mask = mask.reshape(N, -1, 1)
+            mask = jnp.reshape(mask, (-1, *jnp.shape(mask)[2:]))  # [NG*N, L]
+            mask = jnp.expand_dims(mask, axis=-1)  # [NG*N, L, 1]
             x = mask_embed * mask + x * (1 - mask)
 
         x = x.reshape(N, -1, self.embed_dim)
