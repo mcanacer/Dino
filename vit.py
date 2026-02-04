@@ -1,6 +1,11 @@
 # Code converted to jax/flax
 # https://github.com/facebookresearch/dino/blob/main/vision_transformer.py
 
+# Mixed precision policy
+# - params: float32
+# - compute: bfloat16
+# - norm / softmax / sinkhorn: float32
+
 import math
 import typing
 from typing import Callable, Optional
@@ -30,8 +35,8 @@ class LayerScale(nn.Module):
     def __call__(self, inputs):
         embed_dim = jnp.shape(inputs)[-1]
 
-        scale = self.param('scale', nn.initializers.constant(self.init_values), (embed_dim,))
-        return inputs * scale
+        scale = self.param('scale', nn.initializers.constant(self.init_values), (embed_dim,), jnp.float32)
+        return inputs * scale.astype(inputs.dtype)
 
 
 class DropPath(nn.Module):
@@ -50,6 +55,7 @@ class SwiGLU(nn.Module):
     out_features: Optional[int] = None
     act_layer: Callable = nn.silu
     drop: float = 0.
+    dtype: jnp.dtype = jnp.bfloat16
 
     @nn.compact
     def __call__(self, x, deterministic=False):
@@ -59,10 +65,20 @@ class SwiGLU(nn.Module):
 
         hidden_features = (int(hidden_features * 2 / 3) + 7) // 8 * 8
 
-        x = nn.Dense(2 * hidden_features, kernel_init=nn.initializers.truncated_normal(stddev=0.02))(x)
+        x = nn.Dense(
+            2 * hidden_features,
+            kernel_init=nn.initializers.truncated_normal(stddev=0.02),
+            dtype=self.dtype,
+            param_dtype=jnp.float32,
+        )(x)
         x1, x2 = jnp.split(x, 2, axis=-1)
         x = self.act_layer(x1) * x2
-        x = nn.Dense(out_features, kernel_init=nn.initializers.truncated_normal(stddev=0.02))(x)
+        x = nn.Dense(
+            out_features,
+            kernel_init=nn.initializers.truncated_normal(stddev=0.02),
+            dtype=self.dtype,
+            param_dtype=jnp.float32,
+        )(x)
         return x
 
 
@@ -71,6 +87,7 @@ class Mlp(nn.Module):
     out_features: Optional[int] = None
     act_layer: Callable = nn.gelu
     drop: float = 0.
+    dtype: jnp.dtype = jnp.bfloat16
 
     @nn.compact
     def __call__(self, x, deterministic=False):
@@ -78,10 +95,20 @@ class Mlp(nn.Module):
         out_features = self.out_features or in_features
         hidden_features = self.hidden_features or in_features
 
-        x = nn.Dense(hidden_features, kernel_init=nn.initializers.truncated_normal(stddev=0.02))(x)
+        x = nn.Dense(
+            hidden_features,
+            kernel_init=nn.initializers.truncated_normal(stddev=0.02),
+            dtype=self.dtype,
+            param_dtype=jnp.float32,
+        )(x)
         x = self.act_layer(x)
         x = nn.Dropout(rate=self.drop)(x, deterministic=deterministic)
-        x = nn.Dense(out_features, kernel_init=nn.initializers.truncated_normal(stddev=0.02),)(x)
+        x = nn.Dense(
+            out_features,
+            kernel_init=nn.initializers.truncated_normal(stddev=0.02),
+            dtype=self.dtype,
+            param_dtype=jnp.float32,
+        )(x)
         x = nn.Dropout(rate=self.drop)(x, deterministic=deterministic)
         return x
 
@@ -98,16 +125,19 @@ class Block(nn.Module):
     drop_path: float = 0.
     act_layer: Callable = nn.silu
     eps: float = 1e-06
+    dtype: jnp.dtype = jnp.bfloat16
 
     @nn.compact
     def __call__(self, x, deterministic=False, return_attention=False):
         y = nn.MultiHeadAttention(
             num_heads=self.num_heads,
+            dtype=self.dtype,
+            param_dtype=jnp.float32,
             use_bias=self.qkv_bias,
             dropout_rate=self.attn_drop,
             kernel_init=nn.initializers.truncated_normal(stddev=0.02),
             bias_init=nn.initializers.zeros,
-        )(nn.LayerNorm(epsilon=self.eps)(x), deterministic=deterministic)
+        )(nn.LayerNorm(epsilon=self.eps, dtype=jnp.float32)(x), deterministic=deterministic)
 
         if self.init_values is not None:
             y = LayerScale(self.init_values)(y)
@@ -120,8 +150,9 @@ class Block(nn.Module):
         mlp_out = self.ffn(
             hidden_features=mlp_hidden_dim,
             act_layer=self.act_layer,
-            drop=self.drop
-        )(nn.LayerNorm(epsilon=self.eps)(x), deterministic=deterministic)
+            drop=self.drop,
+            dtype=self.dtype,
+        )(nn.LayerNorm(epsilon=self.eps, dtype=jnp.float32)(x), deterministic=deterministic)
         if self.init_values is not None:
             mlp_out = LayerScale(self.init_values)(mlp_out)
 
@@ -136,6 +167,7 @@ class PatchEmbed(nn.Module):
     patch_size: int = 16
     in_chans: int = 3
     embed_dim: int = 768
+    dtype: jnp.dtype = jnp.bfloat16
 
     def setup(self):
         self.num_patches = (self.img_size // self.patch_size) ** 2
@@ -147,7 +179,9 @@ class PatchEmbed(nn.Module):
             self.embed_dim,
             kernel_size=(self.patch_size, self.patch_size),
             strides=(self.patch_size, self.patch_size),
-            padding='VALID'
+            padding='VALID',
+            dtype=self.dtype,
+            param_dtype=jnp.float32,
         )(x)
         x = x.reshape(N, -1, self.embed_dim)
         return x
@@ -170,6 +204,7 @@ class VisionTransformer(nn.Module):
     mask_im_modeling: bool = False
     num_registers: int = 4
     eps: float = 1e-06
+    dtype: jnp.dtype = jnp.bfloat16
 
     def setup(self):
         self.num_features = self.embed_dim
@@ -177,7 +212,8 @@ class VisionTransformer(nn.Module):
             img_size=self.img_size,
             patch_size=self.patch_size,
             in_chans=self.in_chans,
-            embed_dim=self.embed_dim
+            embed_dim=self.embed_dim,
+            dtype=self.dtype,
         )
         num_patches = self.patch_embed.num_patches
 
@@ -242,6 +278,9 @@ class VisionTransformer(nn.Module):
                                         (1, self.num_registers, self.embed_dim))
         else:
             register_embed = None
+
+        x = x.astype(self.dtype)
+
         cls_token = self.param('cls_token', nn.initializers.truncated_normal(stddev=1e-6), (1, 1, self.embed_dim))
         pos_embed = self.param(
             'pos_embed',
@@ -264,9 +303,10 @@ class VisionTransformer(nn.Module):
                 attn_drop=self.attn_drop_rate,
                 drop_path=dpr[i],
                 eps=self.eps,
+                dtype=self.dtype,
             )(x, deterministic=not train)
 
-        x_norm = nn.LayerNorm(epsilon=self.eps)(x)
+        x_norm = nn.LayerNorm(epsilon=self.eps, dtype=jnp.float32)(x)
 
         return {
             "cls_tokens": x[:, 0],

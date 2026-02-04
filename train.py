@@ -101,7 +101,7 @@ def make_update_fn(
             g_student_cls = student_cls[:num_global_crops]  # [NG, N, E]
             l_student_cls = student_cls[num_global_crops:]  # [NL, N, E]
 
-            l_cls_log_probs = jax.nn.log_softmax(l_student_cls, axis=-1)  # [NL, N, E]
+            l_cls_log_probs = jax.nn.log_softmax(l_student_cls.astype(jnp.float32), axis=-1)  # [NL, N, E]
             l_cls_log_probs = jnp.expand_dims(l_cls_log_probs, axis=1)  # [NL, 1, N, E]
 
             loss = teacher_cls * l_cls_log_probs  # [NL, NG, N, E]
@@ -110,7 +110,7 @@ def make_update_fn(
 
             l_cls_loss = l_loss_weight * loss
 
-            g_cls_log_probs = jax.nn.log_softmax(g_student_cls, axis=-1)  # [NG, N, E]
+            g_cls_log_probs = jax.nn.log_softmax(g_student_cls.astype(jnp.float32), axis=-1)  # [NG, N, E]
             g_cls_log_probs = jnp.expand_dims(g_cls_log_probs, axis=1)  # [NG, 1, N, E]
 
             loss = teacher_cls * g_cls_log_probs  # [NG, NG, N, E]
@@ -127,7 +127,7 @@ def make_update_fn(
             teacher_patch = jnp.reshape(teacher_patch,
                                         (num_global_crops, -1, *teacher_patch.shape[-2:]))  # [NG, N, L, E]
 
-            patch_log_probs = jax.nn.log_softmax(student_patch, axis=-1)  # [NG, N, L, E]
+            patch_log_probs = jax.nn.log_softmax(student_patch.astype(jnp.float32), axis=-1)  # [NG, N, L, E]
 
             loss = teacher_patch * patch_log_probs  # [NG, N, L, E]
             loss = jnp.sum(loss, axis=-1)  # [NG, N, L]
@@ -162,6 +162,7 @@ def make_update_fn(
             )
 
             total_loss = g_cls_loss + l_cls_loss + ibot_loss + koleo_loss
+            total_loss = total_loss.astype(jnp.float32)
 
             return total_loss, losses
 

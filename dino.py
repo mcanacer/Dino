@@ -2,27 +2,36 @@ import jax
 import jax.numpy as jnp
 
 import flax.linen as nn
-from utils import sinkhorn_knopp
-
-
-def l2(x, axis=-1, eps=1e-7):
-    return x * jax.lax.rsqrt((x * x).sum(axis=axis, keepdims=True) + eps)
+from utils import sinkhorn_knopp, l2
 
 
 class Projection(nn.Module):
     hidden_dim: int
     bottleneck_dim: int
     n_layers: int = 3
+    dtype: jnp.dtype = jnp.bfloat16
 
     @nn.compact
     def __call__(self, x, train=True):
-        x = nn.Dense(features=self.hidden_dim)(x)
+        x = nn.Dense(
+            features=self.hidden_dim,
+            dtype=self.dtype,
+            param_dtype=jnp.float32,
+        )(x)
         x = jax.nn.gelu(x)
         for _ in range(self.n_layers - 2):
-            x = nn.Dense(features=self.hidden_dim)(x)
+            x = nn.Dense(
+                features=self.hidden_dim,
+                dtype=self.dtype,
+                param_dtype=jnp.float32,
+            )(x)
             x = jax.nn.gelu(x)
 
-        x = nn.Dense(features=self.bottleneck_dim)(x)
+        x = nn.Dense(
+            features=self.bottleneck_dim,
+            dtype=self.dtype,
+            param_dtype=jnp.float32,
+        )(x)
         return x
 
 
@@ -35,15 +44,19 @@ class Head(nn.Module):
     norm_eps: float = 1e-12
     weight_norm_eps: float = 1e-12
 
+    dtype: jnp.dtype = jnp.bfloat16
+
     @nn.compact
     def __call__(self, x, train=False):
-        x = l2(x, axis=-1, eps=self.norm_eps)
+        x = l2(x.astype(jnp.float32), axis=-1, eps=self.norm_eps)
 
         mdl = nn.Dense(
             features=self.hidden_dim,
             use_bias=self.use_bias,
             kernel_init=nn.initializers.truncated_normal(0.02),
             bias_init=nn.initializers.zeros,
+            dtype=self.dtype,
+            param_dtype=jnp.float32,
         )
         if self.use_weight_norm:
             mdl = nn.WeightNorm(mdl, epsilon=self.weight_norm_eps)
@@ -73,7 +86,7 @@ class DINO(nn.Module):
             teacher_cls = self.dino_head(teacher_cls)
 
             global_out["target_cls"] = sinkhorn_knopp(
-                teacher_cls / tau,
+                (teacher_cls / tau).astype(jnp.float32),
                 axis_name="batch" if train else None,
             )
 
@@ -84,7 +97,7 @@ class DINO(nn.Module):
                 teacher_patch = self.ibot_head(teacher_patch)
 
                 global_out["target_patch"] = sinkhorn_knopp(
-                    teacher_patch / tau,
+                    (teacher_patch / tau).astype(jnp.float32),
                     mask=masks,
                     axis_name="batch" if train else None,
                 )
