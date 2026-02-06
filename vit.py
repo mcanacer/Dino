@@ -269,23 +269,29 @@ class VisionTransformer(nn.Module):
     @nn.compact
     def __call__(self, x, masks=None, train=True):
         if self.mask_im_modeling:
-            mask_embed = self.param('mask_embed', nn.initializers.zeros, (1, self.embed_dim))
+            mask_embed = self.param('mask_embed', nn.initializers.zeros, (1, self.embed_dim), jnp.float32)
         else:
             mask_embed = None
         if self.num_registers > 0:
             register_embed = self.param('register_embed',
                                         nn.initializers.truncated_normal(stddev=1e-6),
-                                        (1, self.num_registers, self.embed_dim))
+                                        (1, self.num_registers, self.embed_dim), jnp.float32)
         else:
             register_embed = None
 
         x = x.astype(self.dtype)
 
-        cls_token = self.param('cls_token', nn.initializers.truncated_normal(stddev=1e-6), (1, 1, self.embed_dim))
+        cls_token = self.param(
+            'cls_token',
+            nn.initializers.truncated_normal(stddev=1e-6),
+            (1, 1, self.embed_dim),
+            jnp.float32,
+        )
         pos_embed = self.param(
             'pos_embed',
             nn.initializers.truncated_normal(stddev=0.02),
-            (1, self.num_patches + 1, self.embed_dim)
+            (1, self.num_patches + 1, self.embed_dim),
+            jnp.float32
         )
 
         x = self.prepare_tokens(x, cls_token, pos_embed, mask_embed, masks, register_embed)
