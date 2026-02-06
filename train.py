@@ -149,7 +149,7 @@ def make_update_fn(
             g_raw_cls_tokens = jnp.reshape(g_raw_cls_tokens,
                                            (num_global_crops, -1, g_raw_cls_tokens.shape[-1]))  # [NG, N, E]
 
-            loss = batch_koleo(g_raw_cls_tokens)  # [NG, N]
+            loss = batch_koleo(g_raw_cls_tokens.astype(jnp.float32))  # [NG, N]
             loss = -jnp.mean(loss)  # [1]
 
             koleo_loss = koleo_loss_weight *  loss
