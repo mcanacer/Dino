@@ -16,14 +16,17 @@ from utils import batch_koleo
 import numpy as np
 
 
-def make_teacher_temp_fn(warmup_teacher_temp, teacher_temp, warmup_teacher_temp_epochs, epochs):
+def make_teacher_temp_fn(warmup_teacher_temp, teacher_temp, warmup_teacher_temp_epochs, epochs, niter_per_epoch):
     def teacher_temp_fn(step):
         idx = jnp.minimum(step, len(teacher_temp_schedule) - 1)
         return teacher_temp_schedule[idx]
+
+    warmup_steps = warmup_teacher_temp_epochs * niter_per_epoch
+    total_steps = epochs * niter_per_epoch
     teacher_temp_schedule = jnp.concatenate((
         jnp.linspace(warmup_teacher_temp,
-                    teacher_temp, warmup_teacher_temp_epochs),
-        jnp.ones(epochs - warmup_teacher_temp_epochs) * teacher_temp
+                    teacher_temp, warmup_steps),
+        jnp.ones(total_steps - warmup_steps) * teacher_temp
     ))
     return teacher_temp_fn
 
@@ -61,15 +64,25 @@ def make_update_fn(
         num_crops,
         num_global_crops,
         koleo_loss_weight):
+
+    g_loss_weight = (num_global_crops - 1) * num_global_crops
+    l_loss_weight = max((num_crops - num_global_crops) * num_global_crops, 1)
+    dino_total_weight = g_loss_weight + l_loss_weight
+
+    g_loss_weight = g_loss_weight / dino_total_weight
+    l_loss_weight = l_loss_weight / dino_total_weight
+
+    g_cls_diag_mask = (1 - jnp.eye(num_global_crops))[:, :, None]  # [NG, NG, 1]
+
     def update_fn(student_params, teacher_params, opt_state, inputs, masks, rng, step):
-        teacher_out_dict = teacher_apply_fn(
+        teacher_out_dict = jax.lax.stop_gradient(teacher_apply_fn(
             teacher_params,
             inputs,
             is_teacher=True,
             masks=masks,
             train=True,
             tau=teacher_temp_fn(step),
-        )
+        ))
 
         def loss_fn(params):
             student_out_dict = student_apply_fn(
@@ -87,13 +100,6 @@ def make_update_fn(
 
             student_patch = student_out_dict.get('predict_patch')  # [NG*N, L, E]
             teacher_patch = teacher_out_dict.get('target_patch')  # [NG*N, L, E]
-
-            g_loss_weight = (num_global_crops - 1) * num_global_crops
-            l_loss_weight = max((num_crops - num_global_crops) * num_global_crops , 1)
-            dino_total_weight = g_loss_weight + l_loss_weight
-
-            g_loss_weight = g_loss_weight / dino_total_weight
-            l_loss_weight = l_loss_weight / dino_total_weight
 
             student_cls = jnp.reshape(student_cls, (num_crops, -1, student_cls.shape[-1]))  # [NC, N, E]
             teacher_cls = jnp.reshape(teacher_cls, (num_global_crops, -1, teacher_cls.shape[-1]))  # [NG, N, E]
@@ -115,10 +121,7 @@ def make_update_fn(
 
             loss = teacher_cls * g_cls_log_probs  # [NG, NG, N, E]
             loss = jnp.sum(loss, axis=-1)  # [NG, NG, N]
-            loss = jnp.mean(loss, axis=-1)  # [NG, NG]
-
-            mask = 1 - jnp.eye(num_global_crops)  # [NG, NG]
-            loss = -jnp.sum(mask * loss)  # [1]
+            loss = -jnp.sum(g_cls_diag_mask * loss) / jnp.maximum(jnp.sum(g_cls_diag_mask) * loss.shape[-1], 1)  # [1]
 
             g_cls_loss = g_loss_weight * loss
 
@@ -183,7 +186,7 @@ def make_update_fn(
 
         return new_student_params, new_teacher_params, opt_state, loss, losses
 
-    return jax.pmap(update_fn, axis_name='batch', donate_argnums=(0, 1, 2))
+    return jax.pmap(update_fn, axis_name='batch', donate_argnums=(0, 1, 2, 6))
 
 
 def main(config_path):
@@ -324,6 +327,7 @@ def main(config_path):
         teacher_temp=dino_config['teacher_temp'],
         warmup_teacher_temp_epochs=dino_config['warmup_teacher_temp_epochs'],
         epochs=epochs,
+        niter_per_epoch=steps_per_epoch
     )
 
     update_fn = make_update_fn(
@@ -335,6 +339,7 @@ def main(config_path):
         momentum_schedule_fn=momentum_schedule,
         num_crops=dataset_config['num_global_crops'] + dataset_config['num_local_crops'],
         num_global_crops=dataset_config['num_global_crops'],
+        koleo_loss_weight=dino_config['koleo_loss_weight'],
     )
 
     student_params_repl = replicate(student_params)
@@ -373,15 +378,14 @@ def main(config_path):
         ndev, bs, *s = x.shape
         return jnp.reshape(x, (ndev * bs, *s))
 
-    step_repl = replicate(global_step)
-
     for epoch in range(start_epoch, epochs):
+        key, epoch_key = jax.random.split(key)
+        step_keys = jax.random.split(epoch_key, steps_per_epoch)
         for step, (images, masks) in enumerate(train_loader):
-            key, dropout_key = jax.random.split(key)
-            rng_shard = jax.random.split(dropout_key, jax.local_device_count())
+            rng_shard = jax.random.split(step_keys[step], jax.local_device_count())
 
-            images = jax.tree_util.tree_map(lambda x: shard(np.array(x)), images)
-            masks = jax.tree_util.tree_map(lambda x: shard(np.array(x)), masks) if masks is not None else None
+            images = jax.tree_util.tree_map(lambda x: shard(x.numpy()), images)
+            masks = jax.tree_util.tree_map(lambda x: shard(x.numpy()), masks) if masks is not None else None
 
             (
                 student_params_repl,
@@ -396,12 +400,13 @@ def main(config_path):
                 images,
                 masks,
                 rng_shard,
-                step_repl
+                replicate(global_step)
             )
 
-            step_repl = step_repl + 1
+            global_step += 1
 
             loss = unreplicate(loss)
+            losses = jax.tree_util.tree_map(lambda x: float(x[0]), losses)
 
             run.log({
                 "total_loss": loss,
@@ -416,7 +421,7 @@ def main(config_path):
             "student_params": unreplicate(student_params_repl),
             "teacher_params": unreplicate(teacher_params_repl),
             "opt_state": unreplicate(opt_state_repl),
-            "epoch": epoch + 1,
+            "epoch": epoch,
             "key": key,
         })
 

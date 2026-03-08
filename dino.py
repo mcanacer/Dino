@@ -105,7 +105,7 @@ class DINO(nn.Module):
             return global_out
         else:
             global_crops = jnp.concatenate(x_list[:self.num_global_crops], axis=0)
-            global_out = self.backbone(global_crops, masks=masks, train=False)
+            global_out = self.backbone(global_crops, masks=masks, train=train)
 
             student_cls = global_out['norm_cls_tokens']
             student_patch = global_out['norm_patch_tokens'] if self.apply_ibot else None
@@ -125,7 +125,7 @@ class DINO(nn.Module):
                 student_patch = self.ibot_head(student_patch)
 
             student_cls = student_cls / tau
-            student_patch = student_patch / tau
+            student_patch = student_patch / tau if student_patch is not None else None
 
             global_out["predict_cls"] = student_cls
             global_out["predict_patch"] = student_patch

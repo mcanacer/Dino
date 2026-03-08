@@ -1,6 +1,6 @@
 dataset_params:
   dataset: 'imagenet'
-  img_size: 224
+  image_size: 224
   batch_size: 1024
   patch_size: 16
   pred_ratio: 0.3
@@ -16,41 +16,37 @@ dataset_params:
 
 dino:
   seed: 61
-  optim_params:
-    linear_lr: 0.001
-    lr: 0.0005
-    beta1: 0.9
-    beta2: 0.999
-    min_lr: 1e-6
-    warmup_epochs: 10
-    weight_decay: 0.04
-    weight_decay_end: 0.4
-    grad_clip: 3.0
-    momentum_teacher: 0.996
   arch: vit_small
+  epochs: 100
+  linear_epochs: 500
+  student_temp: 0.1
+  teacher_temp: 0.04
+  warmup_teacher_temp: 0.04
+  warmup_teacher_temp_epochs: 0
+  koleo_loss_weight: 0.1
+  checkpoint_path: /home/muhammetcan/checkpoints/dino_vit_small_16.pkl
+  linear_eval_checkpoint_path: /home/muhammetcan/checkpoints/dino_vit_small_16_lineareval.pkl
+  num_classes: 1000
   student_params:
     patch_size: 16
     drop_path_rate: 0.1
     mask_im_modeling: True
   teacher_params:
     patch_size: 16
-  head_params:
-    out_dim: 8192
-    norm_last_layer: True
+  proj_params:
     hidden_dim: 2048
     bottleneck_dim: 256
-  num_classes: 1000
-  student_temp: 0.1
-  teacher_temp: 0.04
-  teacher_temp2: 0.07
-  warmup_teacher_temp: 0.04
-  warmup_teacher_temp2: 0.04
-  warmup_teacher_temp_epochs: 0
-  warmup_teacher_patch_temp: 30
-  checkpoint_path: /home/muhammetcan/checkpoints/dino_vit_small_16.pkl
-  linear_eval_checkpoint_path: /home/muhammetcan/checkpoints/dino_vit_small_16_lineareval.pkl
-  epochs: 100
-  linear_epochs: 500
+    n_layers: 3
+  head_params:
+    hidden_dim: 8192
+  optim_params:
+    lr: 0.0005
+    min_lr: 1e-6
+    warmup_epochs: 10
+    weight_decay: 0.04
+    weight_decay_end: 0.4
+    grad_clip: 3.0
+    momentum_teacher: 0.996
 
 wandb:
   project: 'DINO'
