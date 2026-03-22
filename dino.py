@@ -98,7 +98,7 @@ class DINO(nn.Module):
 
                 global_out["target_patch"] = sinkhorn_knopp(
                     (teacher_patch / tau).astype(jnp.float32),
-                    mask=masks,
+                    mask=masks.transpose(1, 0, 2),  # [N, NG, L] -> [NG, N, L]
                     axis_name="batch" if train else None,
                 )
 

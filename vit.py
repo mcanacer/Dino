@@ -251,18 +251,18 @@ class VisionTransformer(nn.Module):
         if mask is not None:
             mask = jnp.reshape(mask, (-1, *jnp.shape(mask)[2:]))  # [NG*N, L]
             mask = jnp.expand_dims(mask, axis=-1)  # [NG*N, L, 1]
-            x = mask_embed * mask + x * (1 - mask)
+            x = mask_embed.astype(x.dtype) * mask + x * (1 - mask)
 
         x = x.reshape(N, -1, self.embed_dim)
 
-        cls_tokens = jnp.broadcast_to(cls_token, (N, 1, self.embed_dim))
+        cls_tokens = jnp.broadcast_to(cls_token.astype(x.dtype), (N, 1, self.embed_dim))
         x = jnp.concatenate([cls_tokens, x], axis=1)
 
         x = x + self.interpolate_pos_encoding(x, W, H, pos_embed)
 
         if self.num_registers > 0:
             register_embed = jnp.repeat(register_embed, N, axis=0)
-            x = jnp.concatenate([x[:, :1], register_embed, x[:, 1:]], axis=1)
+            x = jnp.concatenate([x[:, :1], register_embed, x[:, 1:]], axis=1).astype(x.dtype)
 
         return x
 

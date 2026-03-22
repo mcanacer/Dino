@@ -84,12 +84,14 @@ def make_update_fn(
             tau=teacher_temp_fn(step),
         ))
 
+        ibot_mask = masks
+
         def loss_fn(params):
             student_out_dict = student_apply_fn(
                 params,
                 inputs,
                 is_teacher=False,
-                masks=masks,
+                masks=ibot_mask,
                 train=True,
                 tau=student_temp,
                 rngs={"dropout": rng}
@@ -135,12 +137,12 @@ def make_update_fn(
             loss = teacher_patch * patch_log_probs  # [NG, N, L, E]
             loss = jnp.sum(loss, axis=-1)  # [NG, N, L]
 
-            masks = jnp.reshape(masks, (masks.shape[0], num_global_crops, -1))  # [N, NG, L]
-            masks = jnp.swapaxes(masks, 0, 1)  # [NG, N, L]
+            reshaped_mask = jnp.reshape(ibot_mask, (ibot_mask.shape[0], num_global_crops, -1))  # [N, NG, L]
+            reshaped_mask = jnp.swapaxes(reshaped_mask, 0, 1)  # [NG, N, L]
 
-            loss = jnp.sum(masks * loss, axis=-1)  # [NG, N]
+            loss = jnp.sum(reshaped_mask * loss, axis=-1)  # [NG, N]
 
-            mask_counts = jnp.sum(masks, axis=-1)  # [NG, N]
+            mask_counts = jnp.sum(reshaped_mask, axis=-1)  # [NG, N]
             count_mask = mask_counts != 0  # [NG, N]
             loss /= jnp.where(count_mask, mask_counts, jnp.ones(()))  # [NG, N]
             loss = -jnp.sum(loss)  # [1]
@@ -186,7 +188,7 @@ def make_update_fn(
 
         return new_student_params, new_teacher_params, opt_state, loss, losses
 
-    return jax.pmap(update_fn, axis_name='batch', donate_argnums=(0, 1, 2, 6))
+    return jax.pmap(update_fn, axis_name='batch', donate_argnums=(0, 1, 2))
 
 
 def main(config_path):
@@ -280,19 +282,19 @@ def main(config_path):
 
     steps_per_epoch = len(train_loader)
 
-    init_lr = dino_config['optim_params']['lr'] * dataset_config['batch_size'] / 256
+    init_lr = float(dino_config['optim_params']['lr'] * dataset_config['batch_size']) / 256
 
     lr_schedule = create_dino_scheduler(
         init_lr,
-        dino_config['optim_params']["min_lr"],
+        float(dino_config['optim_params']["min_lr"]),
         epochs,
         steps_per_epoch,
         warmup_epochs=dino_config['optim_params']['warmup_epochs'],
     )
 
     wd_schedule = create_dino_scheduler(
-        dino_config['optim_params']['weight_decay'],
-        dino_config['optim_params']['weight_decay_end'],
+        float(dino_config['optim_params']['weight_decay']),
+        float(dino_config['optim_params']['weight_decay_end']),
         epochs,
         steps_per_epoch,
     )
