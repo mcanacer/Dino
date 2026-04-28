@@ -8,7 +8,7 @@ from torchvision.datasets import ImageFolder
 from torch.utils.data import DataLoader
 import wandb
 from augmentation import DataAugmentationDINO, Collate
-from utils import load_checkpoint, save_checkpoint
+import orbax.checkpoint as ocp
 import vit
 from dino import DINO, Head, Projection
 from utils import batch_koleo
@@ -48,7 +48,7 @@ def create_dino_scheduler(base_value, final_value, epochs, niter_per_epoch, warm
     warmup_schedule = jnp.linspace(start_warmup_value, base_value, warmup_iters)
 
     iters = jnp.arange(total_iters - warmup_iters)
-    schedule = final_value + 0.5 * (base_value - final_value) * (1 + np.cos(np.pi * iters / len(iters)))
+    schedule = final_value + 0.5 * (base_value - final_value) * (1 + jnp.cos(np.pi * iters / len(iters)))
 
     schedule = jnp.concatenate([warmup_schedule, schedule])
     return schedule_fn
@@ -269,6 +269,15 @@ def main(config_path):
     )
 
     checkpoint_path = dino_config['checkpoint_path']
+    ckpt_options = ocp.CheckpointManagerOptions(
+        max_to_keep=2,  # Keep last 2 checkpoints automatically
+        create=True,
+    )
+    ckpt_mngr = ocp.CheckpointManager(
+        checkpoint_path,
+        ocp.PyTreeCheckpointer(),
+        options=ckpt_options,
+    )
 
     inputs, masks = next(iter(train_loader))
     inputs = [np.array(x) for x in inputs]
@@ -360,17 +369,22 @@ def main(config_path):
     del teacher_params
     del opt_state
 
-    loaded_state = load_checkpoint(checkpoint_path, state_template)
+    latest_step = ckpt_mngr.latest_step()
     start_epoch = 0
     global_step = 0
 
-    if loaded_state:
+    if latest_step is not None:
+        loaded_state = ckpt_mngr.restore(
+            latest_step,
+            args=ocp.args.StandardRestore(state_template)
+        )
         student_params_repl = replicate(loaded_state['student_params'])
         teacher_params_repl = replicate(loaded_state['teacher_params'])
         opt_state_repl = replicate(loaded_state['opt_state'])
         start_epoch = loaded_state['epoch'] + 1
         key = loaded_state['key']
         global_step = steps_per_epoch * start_epoch
+        print(f"Restored checkpoint from epoch {latest_step}, resuming at epoch {start_epoch}")
 
     def shard(x):
         n, *s = x.shape
@@ -419,13 +433,16 @@ def main(config_path):
                 "epoch": epoch,
             })
 
-        save_checkpoint(checkpoint_path, {
-            "student_params": unreplicate(student_params_repl),
-            "teacher_params": unreplicate(teacher_params_repl),
-            "opt_state": unreplicate(opt_state_repl),
-            "epoch": epoch,
-            "key": key,
-        })
+        ckpt_mngr.save(
+            epoch,
+            args=ocp.args.StandardSave({
+                "student_params": unreplicate(student_params_repl),
+                "teacher_params": unreplicate(teacher_params_repl),
+                "opt_state": unreplicate(opt_state_repl),
+                "epoch": epoch,
+                "key": key,
+            })
+        )
 
 
 if __name__ == '__main__':
