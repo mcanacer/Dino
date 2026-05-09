@@ -8,7 +8,7 @@ from flax import serialization
 
 
 def pairwise_distance(a, b, p=2, eps=1e-8):
-    return jnp.pow(jnp.sum(jnp.pow(a - b, p), axis=-1), 1 / (p + eps))
+    return jnp.pow(jnp.sum(jnp.pow(a - b, p), axis=-1) + eps, 1.0 / p)
 
 
 def l2(x, axis=-1, eps=1e-7):
@@ -90,4 +90,3 @@ def load_checkpoint(path, state_template):
         return None
     with open(path, "rb") as f:
         return serialization.from_bytes(state_template, f.read())
-

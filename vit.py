@@ -249,7 +249,9 @@ class VisionTransformer(nn.Module):
         x = self.patch_embed(x)
 
         if mask is not None:
-            mask = jnp.reshape(mask, (-1, *jnp.shape(mask)[2:]))  # [NG*N, L]
+            if mask.ndim == 3:
+                mask = jnp.transpose(mask, (1, 0, 2))  # [N, NG, L] -> [NG, N, L]
+                mask = jnp.reshape(mask, (-1, mask.shape[-1]))  # [NG*N, L]
             mask = jnp.expand_dims(mask, axis=-1)  # [NG*N, L, 1]
             x = mask_embed.astype(x.dtype) * mask + x * (1 - mask)
 
@@ -296,8 +298,9 @@ class VisionTransformer(nn.Module):
 
         x = self.prepare_tokens(x, cls_token, pos_embed, mask_embed, masks, register_embed)
 
-        dpr = [x for x in np.linspace(0, self.drop_path_rate, self.depth)]
+        dpr = [float(p) for p in np.linspace(0, self.drop_path_rate, self.depth)]
 
+        block_outputs = []
         for i in range(self.depth):
             x = Block(
                 num_heads=self.num_heads,
@@ -311,8 +314,14 @@ class VisionTransformer(nn.Module):
                 eps=self.eps,
                 dtype=self.dtype,
             )(x, deterministic=not train)
+            block_outputs.append(x)
 
-        x_norm = nn.LayerNorm(epsilon=self.eps, dtype=jnp.float32)(x)
+        final_norm = nn.LayerNorm(epsilon=self.eps, dtype=jnp.float32)
+        x_norm = final_norm(x)
+
+        per_block_norm_cls = jnp.stack(
+            [final_norm(blk)[:, 0] for blk in block_outputs], axis=0
+        )
 
         return {
             "cls_tokens": x[:, 0],
@@ -321,6 +330,7 @@ class VisionTransformer(nn.Module):
             "norm_cls_tokens": x_norm[:, 0],
             "norm_registers": x_norm[:, 1:self.num_registers + 1],
             "norm_patch_tokens": x_norm[:, self.num_registers + 1:],
+            "per_block_norm_cls": per_block_norm_cls,  # [depth, N, E]
         }
 
 
