@@ -20,11 +20,7 @@ import wandb
 
 import vit
 
-
-# ---------- checkpoints ----------------------------------------------------
-
 def save_eval_state(path, state):
-    """Save the linear classifier's own state (not the pretrained ViT)."""
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     with open(path, "wb") as f:
         f.write(serialization.to_bytes(state))
@@ -38,12 +34,6 @@ def load_eval_state(path, state_template):
 
 
 def load_pretrained_backbone_params(checkpoint_dir, source="teacher"):
-    """Restore an Orbax training checkpoint and return only the backbone
-    params, wrapped as a Flax variables dict so that ``backbone.apply`` works.
-
-    ``source`` selects 'teacher' (recommended for downstream eval) or
-    'student'.
-    """
     if not os.path.isdir(checkpoint_dir):
         raise FileNotFoundError(checkpoint_dir)
 
@@ -67,12 +57,6 @@ def load_pretrained_backbone_params(checkpoint_dir, source="teacher"):
 
 def extract_features(backbone, vit_variables, inputs, n_last_blocks,
                      avgpool_patchtokens):
-    """Run the backbone in eval mode and produce a [N, feat_dim] tensor.
-
-    Concatenates the CLS tokens from the last ``n_last_blocks`` blocks. If
-    ``avgpool_patchtokens`` is True, the mean-pooled patch tokens of the
-    *final* block are concatenated as well (standard DINO linear-eval recipe).
-    """
     out = backbone.apply(vit_variables, inputs, masks=None, train=False)
 
     # [depth, N, E]
@@ -89,8 +73,6 @@ def extract_features(backbone, vit_variables, inputs, n_last_blocks,
 
     return feats.astype(jnp.float32)
 
-
-# ---------- pmapped train / eval steps ------------------------------------
 
 def make_update_fn(*, backbone, classifier_apply_fn, optimizer,
                    n_last_blocks, avgpool_patchtokens):
@@ -219,14 +201,12 @@ def main(config_path):
         config=config,
     )
 
-    # ---- load pretrained backbone (Orbax) --------------------------------
     pretrained_dir = dino_config["checkpoint_path"]
     vit_variables, src_step = load_pretrained_backbone_params(
         pretrained_dir, source=dino_config.get("eval_source", "teacher")
     )
     print(f"loaded pretrained backbone from step {src_step}")
 
-    # ---- linear eval head ------------------------------------------------
     linear_eval_checkpoint_path = dino_config["linear_eval_checkpoint_path"]
 
     key = jax.random.PRNGKey(seed)
@@ -307,7 +287,6 @@ def main(config_path):
                 print(f"epoch {epoch} step {step}  loss {loss_val:.4f}  acc {acc:.4f}")
             run.log({"loss": loss_val, "train_accuracy": acc, "epoch": epoch})
 
-        # ---- validation --------------------------------------------------
         correct = 0
         total = 0
         for images, labels in val_loader:

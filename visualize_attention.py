@@ -15,9 +15,6 @@ import vit
 
 
 def _get_norm_input_to_block(model, params, inputs, block_idx):
-    """Run the model with capture_intermediates and grab the LayerNorm output
-    that is fed into the attention of the requested block.
-    """
     _, variables = model.apply(
         params,
         inputs,
@@ -27,22 +24,14 @@ def _get_norm_input_to_block(model, params, inputs, block_idx):
         mutable=["intermediates"],
     )
 
-    # Inside Block, the first sub-module called is LayerNorm (its output is
-    # the attention input). With auto-capture, every module's __call__ output
-    # is sown under '__call__' as a one-tuple.
     block_key = f"Block_{block_idx}"
     block_intermediates = variables["intermediates"][block_key]
 
-    # The LayerNorm before attention is LayerNorm_0 (the second LayerNorm,
-    # before the MLP, is LayerNorm_1).
     ln_out = block_intermediates["LayerNorm_0"]["__call__"][0]
     return ln_out
 
 
 def _qk_params_for_block(params, block_idx):
-    """Pull the kernel (and bias, if present) for the query and key Dense
-    layers of the attention in the requested block.
-    """
     block_params = params["params"][f"Block_{block_idx}"]["MultiHeadAttention_0"]
     return block_params["query"], block_params["key"]
 
@@ -68,16 +57,11 @@ def visualize_specific_image(
     img_tensor = transform(raw_img).unsqueeze(0)
     inputs = jnp.array(img_tensor.numpy())
 
-    # 1. Run the model and grab the LayerNormed input to the requested block.
     ln_out = _get_norm_input_to_block(model, params, inputs, block_idx)
-    # ln_out: [1, T, E]    where T = 1 (cls) + num_registers + num_patches
 
-    # 2. Recompute Q and K using the saved kernels.
     q_params, k_params = _qk_params_for_block(params, block_idx)
 
     def project(x, dense_params):
-        # DenseGeneral(features=(num_heads, head_dim)) with axis=-1.
-        # kernel shape: [in_features, num_heads, head_dim]
         kernel = dense_params["kernel"].astype(jnp.float32)
         out = jnp.einsum("btf,fhd->bthd", x.astype(jnp.float32), kernel)
         if "bias" in dense_params:
@@ -92,8 +76,6 @@ def visualize_specific_image(
     attn_logits = jnp.einsum("bqhd,bkhd->bhqk", q, k) / jnp.sqrt(head_dim)
     attn_weights = jax.nn.softmax(attn_logits.astype(jnp.float32), axis=-1)
 
-    # 3. Take the [CLS]-row attention into the patch tokens only (skip cls
-    # itself and the register tokens, which sit between cls and patches).
     num_total_tokens = q.shape[1]
     num_registers = getattr(model, "num_registers", 0)
     num_patches = num_total_tokens - 1 - num_registers
@@ -107,7 +89,6 @@ def visualize_specific_image(
     num_heads = cls_attn.shape[0]
     cls_attn_grid = np.array(cls_attn).reshape(num_heads, grid_size, grid_size)
 
-    # 4. Plot.
     img_array = np.array(raw_img.resize((img_size, img_size))) / 255.0
     fig, axes = plt.subplots(1, num_heads + 1, figsize=(3 * (num_heads + 1), 4))
     axes[0].imshow(img_array)
@@ -130,11 +111,6 @@ def visualize_specific_image(
 
 
 def load_backbone_params_from_orbax(checkpoint_dir, step=None):
-    """Training writes Orbax checkpoints with state
-        {"student_params", "teacher_params", "opt_state", "epoch", "key"}.
-    We restore and pull out the backbone-only sub-tree of the teacher
-    (teacher weights give cleaner attention maps than student).
-    """
     ckpt_mngr = ocp.CheckpointManager(
         checkpoint_dir,
         ocp.PyTreeCheckpointer(),
@@ -180,8 +156,6 @@ def main():
     if args.checkpoint_dir is not None and os.path.isdir(args.checkpoint_dir):
         params = load_backbone_params_from_orbax(args.checkpoint_dir)
     else:
-        # Fallback: random init (so the script still runs end-to-end for
-        # smoke-testing without a trained model).
         print("WARNING: no checkpoint provided, using random params.")
         params = backbone.init(
             jax.random.PRNGKey(args.seed),

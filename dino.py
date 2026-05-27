@@ -71,12 +71,10 @@ class DINO(nn.Module):
     ibot_head: nn.Module
     num_global_crops: int = 2
     num_local_crops: int = 8
-    apply_dino: bool = True
-    apply_ibot: bool = True
 
     @nn.compact
     def __call__(self, x_list, is_teacher=False, masks=None, train=True, tau=1.0):
-        if is_teacher and self.apply_dino:
+        if is_teacher:
             global_crops = jnp.concatenate(x_list[:self.num_global_crops], axis=0)
             global_out = self.backbone(global_crops, train=False)
 
@@ -90,17 +88,16 @@ class DINO(nn.Module):
                 axis_name="batch" if train else None,
             )
 
-            if self.apply_ibot:
-                teacher_patch = global_out["norm_patch_tokens"]
+            teacher_patch = global_out["norm_patch_tokens"]
 
-                teacher_patch = self.ibot_proj(teacher_patch)
-                teacher_patch = self.ibot_head(teacher_patch)
+            teacher_patch = self.ibot_proj(teacher_patch)
+            teacher_patch = self.ibot_head(teacher_patch)
 
-                global_out["target_patch"] = sinkhorn_knopp(
-                    (teacher_patch / tau).astype(jnp.float32),
-                    mask=masks.transpose(1, 0, 2),  # [N, NG, L] -> [NG, N, L]
-                    axis_name="batch" if train else None,
-                )
+            global_out["target_patch"] = sinkhorn_knopp(
+                (teacher_patch / tau).astype(jnp.float32),
+                mask=masks.transpose(1, 0, 2),  # [N, NG, L] -> [NG, N, L]
+                axis_name="batch" if train else None,
+            )
 
             return global_out
         else:
@@ -119,13 +116,11 @@ class DINO(nn.Module):
             student_cls = self.dino_proj(student_cls)
             student_cls = self.dino_head(student_cls)
 
-            if self.apply_ibot:
-                assert student_patch is not None
-                student_patch = self.ibot_proj(student_patch)
-                student_patch = self.ibot_head(student_patch)
+            student_patch = self.ibot_proj(student_patch)
+            student_patch = self.ibot_head(student_patch)
 
             student_cls = student_cls / tau
-            student_patch = student_patch / tau if student_patch is not None else None
+            student_patch = student_patch / tau
 
             global_out["predict_cls"] = student_cls
             global_out["predict_patch"] = student_patch
